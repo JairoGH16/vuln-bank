@@ -131,14 +131,17 @@ def init_auth_routes(app):
             return jsonify({'error': 'Missing credentials'}), 401
             
         # Fix (M1-R01): parameterized query prevents SQL injection (SQLite uses ? placeholders)
+        # Fix (M1-R03): look the user up by username and verify the stored password
+        # hash, instead of comparing plaintext, so this legacy route is consistent
+        # with the hashing logic used everywhere else.
         conn = sqlite3.connect('bank.db')
         c = conn.cursor()
-        query = "SELECT * FROM users WHERE username = ? AND password = ?"
-        c.execute(query, (auth.get('username'), auth.get('password')))
+        query = "SELECT * FROM users WHERE username = ?"
+        c.execute(query, (auth.get('username'),))
         user = c.fetchone()
         conn.close()
-        
-        if not user:
+
+        if not user or not verify_password(auth.get('password'), user[2]):
             return jsonify({'error': 'Invalid credentials'}), 401
 
         if len(user) > 9 and user[9]:

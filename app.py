@@ -486,7 +486,8 @@ def login():
                 )
                 return response
             
-            # Vulnerability: Username enumeration
+            # Fix (M1-R06): identical generic message for an unknown user or a wrong
+            # password, with no debug data, so logins cannot be enumerated.
             record_event(
                 'LOGIN_FAILED',
                 severity='WARNING',
@@ -498,19 +499,15 @@ def login():
 
             return jsonify({
                 'status': 'error',
-                'message': 'Invalid credentials',
-                'debug_info': {  # Vulnerability: Information disclosure
-                    'attempted_username': username,
-                    'time': str(datetime.now())
-                }
+                'message': 'Invalid credentials'
             }), 401
-            
-        except Exception as e:
-            print(f"Login error: {str(e)}")
+
+        except Exception:
+            # Fix (M1-R06): do not expose internal error details to the client.
+            print("Login error")
             return jsonify({
                 'status': 'error',
-                'message': 'Login failed',
-                'error': str(e)
+                'message': 'Login failed'
             }), 500
         
     return render_template('login.html')
@@ -1341,42 +1338,29 @@ def forgot_password():
             )
             
             if user:
-                # Weak reset pin logic (CWE-330)
-                # Using only 3 digits makes it easily guessable
-                reset_pin = secrets.token_urlsafe(32)  # Fix (M1-R04): strong, non-guessable reset token
-                
-                # Store the reset PIN in database (in plaintext - CWE-319)
+                # Fix (M1-R04): store a strong, non-guessable reset token server-side.
+                reset_pin = secrets.token_urlsafe(32)
                 execute_query(
                     "UPDATE users SET reset_pin = %s WHERE username = %s",
                     (reset_pin, username),
                     fetch=False
                 )
-                
-                # Vulnerability: Information disclosure
-                return jsonify({
-                    'status': 'success',
-                    'message': 'Reset PIN has been sent to your email.',
-                    'debug_info': {  # Vulnerability: Information disclosure
-                        'timestamp': str(datetime.now()),
-                        'username': username,
-                        # Fix (M1-R04): the reset token is never returned in the response
-                        'note': 'if the account exists, a reset link was sent'  # Fix (M1-R04)
-                    }
-                })
-            else:
-                # Vulnerability: Username enumeration
-                return jsonify({
-                    'status': 'error',
-                    'message': 'User not found'
-                }), 404
-                
-        except Exception as e:
-            print(f"Forgot password error: {str(e)}")
+
+            # Fix (M1-R06): identical generic response whether or not the account
+            # exists, so this endpoint cannot be used to enumerate usernames.
+            return jsonify({
+                'status': 'success',
+                'message': 'If the account exists, a password reset link has been sent.'
+            }), 200
+
+        except Exception:
+            # Fix (M1-R06): do not leak internal error details to the client.
+            print("Forgot password error")
             return jsonify({
                 'status': 'error',
-                'message': str(e)
+                'message': 'Unable to process the request.'
             }), 500
-            
+
     return render_template('forgot_password.html')
 
 # Reset password endpoint
@@ -1440,41 +1424,27 @@ def api_v1_forgot_password():
         )
         
         if user:
-            # Weak reset pin logic (CWE-330)
-            # Using only 3 digits makes it easily guessable
-            reset_pin = secrets.token_urlsafe(32)  # Fix (M1-R04): strong, non-guessable reset token
-            
-            # Store the reset PIN in database (in plaintext - CWE-319)
+            # Fix (M1-R04): store a strong, non-guessable reset token server-side.
+            reset_pin = secrets.token_urlsafe(32)
             execute_query(
                 "UPDATE users SET reset_pin = %s WHERE username = %s",
                 (reset_pin, username),
                 fetch=False
             )
-            
-            # Vulnerability: Information disclosure
-            return jsonify({
-                'status': 'success',
-                'message': 'Reset PIN has been sent to your email.',
-                'debug_info': {  # Vulnerability: Information disclosure
-                    'timestamp': str(datetime.now()),
-                    'username': username,
-                    # Fix (M1-R04): the reset token is never returned in the response
-                    'note': 'if the account exists, a reset link was sent'  # Fix (M1-R04)
-                }
-            })
-        else:
-            # Vulnerability: Username enumeration
-            return jsonify({
-                'status': 'error',
-                'message': 'User not found'
-            }), 404
-                
-    except Exception as e:
-        # Vulnerability: Detailed error exposure
-        print(f"Forgot password error: {str(e)}")
+
+        # Fix (M1-R06): identical generic response whether or not the account
+        # exists, so this endpoint cannot be used to enumerate usernames.
+        return jsonify({
+            'status': 'success',
+            'message': 'If the account exists, a password reset link has been sent.'
+        }), 200
+
+    except Exception:
+        # Fix (M1-R06): do not leak internal error details to the client.
+        print("Forgot password error")
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': 'Unable to process the request.'
         }), 500
 
 # V2 API - Fixes excessive data exposure but still vulnerable to other issues
@@ -1490,39 +1460,27 @@ def api_v2_forgot_password():
         )
         
         if user:
-            # Weak reset pin logic (CWE-330) - still using 3 digits
-            reset_pin = secrets.token_urlsafe(32)  # Fix (M1-R04): strong, non-guessable reset token
-            
-            # Store the reset PIN in database (in plaintext - CWE-319)
+            # Fix (M1-R04): store a strong, non-guessable reset token server-side.
+            reset_pin = secrets.token_urlsafe(32)
             execute_query(
                 "UPDATE users SET reset_pin = %s WHERE username = %s",
                 (reset_pin, username),
                 fetch=False
             )
-            
-            # Fixed: No longer exposing PIN and PIN length in response
-            return jsonify({
-                'status': 'success',
-                'message': 'Reset PIN has been sent to your email.',
-                'debug_info': {  # Still excessive data exposure but not PIN
-                    'timestamp': str(datetime.now()),
-                    'username': username
-                    # PIN and PIN length removed
-                }
-            })
-        else:
-            # Vulnerability: Username enumeration still possible
-            return jsonify({
-                'status': 'error',
-                'message': 'User not found'
-            }), 404
-                
-    except Exception as e:
-        # Vulnerability: Detailed error exposure still exists
-        print(f"Forgot password error: {str(e)}")
+
+        # Fix (M1-R06): identical generic response whether or not the account
+        # exists, so this endpoint cannot be used to enumerate usernames.
+        return jsonify({
+            'status': 'success',
+            'message': 'If the account exists, a password reset link has been sent.'
+        }), 200
+
+    except Exception:
+        # Fix (M1-R06): do not leak internal error details to the client.
+        print("Forgot password error")
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': 'Unable to process the request.'
         }), 500
 
 # V3 API - Uses 4-digit PIN, otherwise similar vulnerabilities
@@ -1538,38 +1496,27 @@ def api_v3_forgot_password():
         )
         
         if user:
-            # Weak reset pin logic (CWE-330) - now 4 digits but still guessable
-            reset_pin = secrets.token_urlsafe(32)  # Fix (M1-R04): strong, non-guessable reset token
-            
-            # Store the reset PIN in database (in plaintext - CWE-319)
+            # Fix (M1-R04): store a strong, non-guessable reset token server-side.
+            reset_pin = secrets.token_urlsafe(32)
             execute_query(
                 "UPDATE users SET reset_pin = %s WHERE username = %s",
                 (reset_pin, username),
                 fetch=False
             )
-            
-            # Fixed: No PIN exposure in response
-            return jsonify({
-                'status': 'success',
-                'message': 'Reset PIN has been sent to your email.',
-                'debug_info': {  # Still minor data exposure
-                    'timestamp': str(datetime.now()),
-                    'username': username
-                }
-            })
-        else:
-            # Vulnerability: Username enumeration still possible
-            return jsonify({
-                'status': 'error',
-                'message': 'User not found'
-            }), 404
-                
-    except Exception as e:
-        # Vulnerability: Detailed error exposure still exists
-        print(f"Forgot password error: {str(e)}")
+
+        # Fix (M1-R06): identical generic response whether or not the account
+        # exists, so this endpoint cannot be used to enumerate usernames.
+        return jsonify({
+            'status': 'success',
+            'message': 'If the account exists, a password reset link has been sent.'
+        }), 200
+
+    except Exception:
+        # Fix (M1-R06): do not leak internal error details to the client.
+        print("Forgot password error")
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': 'Unable to process the request.'
         }), 500
 
 # API endpoint to get user details (for admin modal)
