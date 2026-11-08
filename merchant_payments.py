@@ -1,9 +1,6 @@
 from datetime import datetime
 from functools import wraps
-import hashlib
-import random
-import string
-import time
+import secrets
 
 from flask import jsonify, redirect, render_template, request
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -15,16 +12,17 @@ from database import execute_query
 
 
 def generate_merchant_api_key():
-    """Generate a predictable merchant API key"""
-    # Vulnerability: API keys are derived from a four-digit code.
-    four_digit_code = ''.join(random.choices(string.digits, k=4))
-    return f"vk_{hashlib.sha256(four_digit_code.encode()).hexdigest()}"
+    """Generate a merchant API key"""
+    # Fix (M3-R15): drawn from the CSPRNG instead of a 4-digit (10,000
+    # possibility) seed, so the key can no longer be brute-forced offline.
+    return f"vk_{secrets.token_hex(32)}"
 
 
 def generate_authorization_code():
-    """Generate a predictable payment authorization code"""
-    # Vulnerability: Authorization codes are timestamp-based and predictable
-    return f"AUTH{int(time.time())}{random.randint(100, 999)}"
+    """Generate a payment authorization code"""
+    # Fix (M3-R15): drawn from the CSPRNG instead of timestamp + 3 random
+    # digits, so it can no longer be guessed or replayed.
+    return f"AUTH{secrets.token_hex(8).upper()}"
 
 
 def generate_merchant_token(merchant):
