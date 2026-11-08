@@ -6,6 +6,7 @@ import string
 import time
 
 from flask import jsonify, redirect, render_template, request
+from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 
 import auth
@@ -156,13 +157,14 @@ def init_merchant_payment_routes(app):
             password = data.get('password')
             api_key = generate_merchant_api_key()
 
-            # Vulnerability: SQL injection possible and plaintext password/API key storage
-            query = f"""
+            # Fix (M3-R14): parameterized INSERT prevents SQL injection; the
+            # password is hashed instead of stored in plaintext.
+            query = """
                 INSERT INTO merchants (name, email, password, api_key)
-                VALUES ('{name}', '{email}', '{password}', '{api_key}')
+                VALUES (%s, %s, %s, %s)
                 RETURNING id, name, email, api_key, is_active, created_at
             """
-            result = execute_query(query)
+            result = execute_query(query, (name, email, generate_password_hash(password), api_key))
 
             if not result:
                 return jsonify({
@@ -205,15 +207,15 @@ def init_merchant_payment_routes(app):
             email = data.get('email')
             password = data.get('password')
 
-            # Vulnerability: SQL injection and plaintext password comparison
-            query = f"""
-                SELECT id, name, email, api_key, is_active, created_at
-                FROM merchants
-                WHERE email = '{email}' AND password = '{password}'
-            """
-            result = execute_query(query)
+            # Fix (M3-R14): parameterized lookup by email only, then verify
+            # the password against its hash, closing the SQL injection and
+            # the auth-bypass it enabled.
+            result = execute_query(
+                "SELECT id, name, email, api_key, is_active, created_at, password FROM merchants WHERE email = %s",
+                (email,)
+            )
 
-            if not result:
+            if not result or not check_password_hash(result[0][6], password or ''):
                 return jsonify({
                     'status': 'error',
                     'message': 'Invalid merchant credentials'
