@@ -2270,30 +2270,40 @@ def get_billers_by_category(category_id):
 def create_bill_payment(current_user):
     try:
         data = request.get_json()
-        
+
         # Get required fields
         biller_id = data.get('biller_id')
-        amount = float(data.get('amount'))
+
+        # Fix (M3-R13): validate payment_method and the amount (positive,
+        # finite, sane range) before any query runs.
         payment_method = data.get('payment_method')
+        if payment_method not in ('balance', 'virtual_card'):
+            return jsonify({'status': 'error', 'message': 'Invalid payment_method'}), 400
+        try:
+            amount = Decimal(str(data.get('amount')))
+        except (InvalidOperation, TypeError):
+            return jsonify({'status': 'error', 'message': 'Invalid amount'}), 400
+        if not amount.is_finite() or amount <= 0 or amount > Decimal('1000000'):
+            return jsonify({'status': 'error', 'message': 'Amount must be between 0 and 1,000,000'}), 400
+        amount = float(amount.quantize(Decimal('0.01')))
+
         card_id = data.get('card_id') if payment_method == 'virtual_card' else None
 
-        payer_query = f"""
-            SELECT id, username, account_number, balance
-            FROM users
-            WHERE id = {current_user['user_id']}
-        """
-        payer = execute_query(payer_query)
+        # Fix (M3-R13): parameterized lookup for both the payer and the biller.
+        payer = execute_query(
+            "SELECT id, username, account_number, balance FROM users WHERE id = %s",
+            (current_user['user_id'],)
+        )
 
-        biller_query = f"""
-            SELECT
-                b.account_number,
-                b.name,
-                bc.name
+        biller = execute_query(
+            """
+            SELECT b.account_number, b.name, bc.name
             FROM billers b
             JOIN bill_categories bc ON b.category_id = bc.id
-            WHERE b.id = {biller_id}
-        """
-        biller = execute_query(biller_query)
+            WHERE b.id = %s
+            """,
+            (biller_id,)
+        )
 
         if not payer or not biller:
             return jsonify({
@@ -2308,21 +2318,18 @@ def create_bill_payment(current_user):
         biller_account_number = biller[0]
         biller_name = biller[1]
         category_name = biller[2]
-        
-        # Vulnerability: No input validation
-        # Vulnerability: No amount validation
-        # Vulnerability: No payment method validation
-        
+
         if payment_method == 'virtual_card' and card_id:
-            # Vulnerability: BOLA - no verification if card belongs to user
-            # Vulnerability: SQL injection possible
-            card_query = f"""
-                SELECT current_balance, card_limit, is_frozen 
-                FROM virtual_cards 
-                WHERE id = {card_id}
-            """
-            card = execute_query(card_query)[0]
-            
+            # Fix (M3-R13): parameterized query, scoped to a card owned by
+            # the authenticated user, closing the BOLA and SQL injection.
+            card = execute_query(
+                "SELECT current_balance, card_limit, is_frozen FROM virtual_cards WHERE id = %s AND user_id = %s",
+                (card_id, current_user['user_id'])
+            )
+            if not card:
+                return jsonify({'status': 'error', 'message': 'Card not found'}), 404
+            card = card[0]
+
             if card[2]:  # is_frozen
                 return jsonify({
                     'status': 'error',
@@ -2428,10 +2435,9 @@ def create_bill_payment(current_user):
 @token_required
 def get_payment_history(current_user):
     try:
-        # Vulnerability: No pagination
-        # Vulnerability: SQL injection possible
-        query = f"""
-            SELECT 
+        # Fix (M3-R13): parameterized query.
+        query = """
+            SELECT
                 bp.*,
                 b.name as biller_name,
                 bc.name as category_name,
@@ -2440,11 +2446,11 @@ def get_payment_history(current_user):
             JOIN billers b ON bp.biller_id = b.id
             JOIN bill_categories bc ON b.category_id = bc.id
             LEFT JOIN virtual_cards vc ON bp.card_id = vc.id
-            WHERE bp.user_id = {current_user['user_id']}
+            WHERE bp.user_id = %s
             ORDER BY bp.created_at DESC
         """
-        
-        payments = execute_query(query)
+
+        payments = execute_query(query, (current_user['user_id'],))
         
         # Vulnerability: Excessive data exposure
         return jsonify({
