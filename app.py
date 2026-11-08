@@ -1988,17 +1988,17 @@ def toggle_card_freeze(current_user, card_id):
 @token_required
 def get_card_transactions(current_user, card_id):
     try:
-        # Vulnerability: BOLA - no verification if card belongs to user
-        # Vulnerability: SQL Injection possible
-        query = f"""
+        # Fix (M3-R12): parameterized query, scoped to a card owned by the
+        # authenticated user, closing the BOLA and SQL injection.
+        query = """
             SELECT ct.*, vc.card_number, vc.currency
             FROM card_transactions ct
             JOIN virtual_cards vc ON ct.card_id = vc.id
-            WHERE ct.card_id = {card_id}
+            WHERE ct.card_id = %s AND vc.user_id = %s
             ORDER BY ct.timestamp DESC
         """
-        
-        transactions = execute_query(query)
+
+        transactions = execute_query(query, (card_id, current_user['user_id']))
         
         # Vulnerability: Information disclosure
         return jsonify({
