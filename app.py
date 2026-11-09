@@ -34,6 +34,8 @@ import socket
 import ipaddress
 import uuid
 import platform
+import http.client
+import ssl
 
 # Load environment variables
 load_dotenv()
@@ -251,6 +253,14 @@ def ai_rate_limit(f):
 UPLOAD_FOLDER = 'static/uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
+
+PROFILE_ALLOWED_MIMES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
+MIME_TO_EXT = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+}
 
 def generate_account_number():
     return ''.join(random.choices(string.digits, k=10))
@@ -776,31 +786,124 @@ def upload_profile_picture(current_user):
             'file_path': file_path  # Vulnerability: Information disclosure
         }), 500
 
-def _is_blocked_host(host):
-    """Fix (M2-R06): resolve the host and block loopback, private, link-local,
-    reserved, multicast and unspecified addresses (SSRF targets)."""
+def _is_blocked_ip(ip_str):
+    """Return True if the IP address must not be contacted (SSRF targets)."""
     try:
-        infos = socket.getaddrinfo(host, None)
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def resolve_safe_ip(hostname):
+    """Resolve hostname once and return a single safe IP, or (None, error).
+
+    Fix (M2-R06/PR): pin the resolved address to prevent DNS rebinding between
+    validation and fetch. The returned IP is the one that will be connected to.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
-        return True  # unresolvable host -> block
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return True
-    return False
+        return None, 'URL host could not be resolved'
+    if not infos:
+        return None, 'URL host could not be resolved'
+    # Pick the first resolved address and require it to be safe. This avoids
+    # mixed-record ambiguity and ensures we connect to the validated address.
+    ip_str = infos[0][4][0]
+    if _is_blocked_ip(ip_str):
+        return None, 'URL host is not allowed'
+    return ip_str, None
 
 
 def validate_import_url(url):
-    """Return an error message if the URL must not be fetched, else None."""
+    """Return (error_message, parsed_url, safe_ip). On success error is None."""
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https'):
-        return 'Only http/https URLs are allowed'
+        return 'Only http/https URLs are allowed', parsed, None
     if not parsed.hostname:
-        return 'Invalid URL host'
-    if _is_blocked_host(parsed.hostname):
-        return 'URL host is not allowed'
-    return None
+        return 'Invalid URL host', parsed, None
+    safe_ip, err = resolve_safe_ip(parsed.hostname)
+    if err:
+        return err, parsed, None
+    return None, parsed, safe_ip
+
+
+def fetch_url_pinned(parsed, safe_ip, allowed_mimes, timeout=10, max_bytes=2 * 1024 * 1024):
+    """Fetch a URL by connecting to a pre-resolved safe IP (DNS rebinding fix).
+
+    Returns (content_bytes, content_type) on success, or (None, error_message).
+    Redirects are not followed; TLS is verified against the original hostname.
+    """
+    hostname = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    conn = None
+    tls_sock = None
+    try:
+        headers = {'Host': hostname, 'User-Agent': 'VulnBank-ImageImport/1.0', 'Connection': 'close'}
+        if parsed.scheme == 'https':
+            context = ssl.create_default_context()
+            raw = socket.create_connection((safe_ip, port), timeout=timeout)
+            try:
+                tls_sock = context.wrap_socket(raw, server_hostname=hostname)
+            except Exception:
+                raw.close()
+                raise
+            # Build a minimal HTTP/1.1 request over the pinned TLS socket.
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {hostname}\r\n"
+                f"User-Agent: VulnBank-ImageImport/1.0\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            tls_sock.sendall(req.encode('ascii'))
+            resp = http.client.HTTPResponse(tls_sock)
+            resp.begin()
+        else:
+            conn = http.client.HTTPConnection(safe_ip, port, timeout=timeout)
+            conn.request('GET', path, headers=headers)
+            resp = conn.getresponse()
+
+        if not (200 <= resp.status < 300):
+            return None, 'Failed to fetch URL'
+
+        content_type = (resp.getheader('Content-Type') or '').split(';', 1)[0].strip().lower()
+        if content_type not in allowed_mimes:
+            return None, 'URL did not return an allowed image type'
+
+        # Read with a hard cap to avoid oversized responses.
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = resp.read(min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b''.join(chunks)
+        if len(content) > max_bytes:
+            return None, 'Image is too large'
+
+        return content, content_type
+    except (socket.timeout, TimeoutError):
+        return None, 'Failed to fetch URL'
+    except (OSError, http.client.HTTPException, ssl.SSLError, ValueError):
+        return None, 'Failed to fetch URL'
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except Exception:
+                pass
 
 
 # Upload profile picture by URL (SSRF-hardened)
@@ -814,27 +917,24 @@ def upload_profile_picture_url(current_user):
         if not image_url:
             return jsonify({'status': 'error', 'message': 'image_url is required'}), 400
 
-        # Fix (M2-R06): validate the URL before fetching to prevent SSRF.
-        url_error = validate_import_url(image_url)
+        # Fix (M2-R06/PR): resolve once and pin the IP to prevent DNS rebinding,
+        # then connect to that fixed IP (with Host/SNI for the original host).
+        url_error, parsed, safe_ip = validate_import_url(image_url)
         if url_error:
             return jsonify({'status': 'error', 'message': url_error}), 400
 
-        # Do not follow redirects (they could point back to internal hosts),
-        # verify TLS, and reject non-image or oversized responses.
-        resp = requests.get(image_url, timeout=10, allow_redirects=False, verify=True)
-        if not (200 <= resp.status_code < 300):
-            return jsonify({'status': 'error', 'message': 'Failed to fetch URL'}), 400
-        if not resp.headers.get('Content-Type', '').startswith('image/'):
-            return jsonify({'status': 'error', 'message': 'URL did not return an image'}), 400
-        content = resp.content
-        if len(content) > 2 * 1024 * 1024:
-            return jsonify({'status': 'error', 'message': 'Image is too large'}), 400
+        content, content_type_or_err = fetch_url_pinned(
+            parsed, safe_ip, PROFILE_ALLOWED_MIMES, timeout=10, max_bytes=2 * 1024 * 1024
+        )
+        if content is None:
+            return jsonify({'status': 'error', 'message': content_type_or_err}), 400
 
-        # Derive filename from URL path (user-controlled)
-        parsed = urlparse(image_url)
-        basename = os.path.basename(parsed.path) or 'downloaded'
-        filename = secure_filename(basename)
-        filename = f"{random.randint(1, 1000000)}_{filename}"
+        # Fix (PR): use a server-generated name with an extension derived from the
+        # validated MIME type (same approach as direct upload), never from the URL.
+        ext = MIME_TO_EXT.get(content_type_or_err)
+        if not ext:
+            return jsonify({'status': 'error', 'message': 'URL did not return an allowed image type'}), 400
+        filename = f"{uuid.uuid4().hex}.{ext}"
         file_path = os.path.join(UPLOAD_FOLDER, filename)
 
         # Save the validated image content.
@@ -1302,7 +1402,14 @@ def create_admin(current_user):
                 'status': 'error',
                 'message': validation_error
             }), 400
-        
+
+        # Fix (M2-R08/PR): require password before hashing (matches /register).
+        if not password:
+            return jsonify({
+                'status': 'error',
+                'message': 'Password is required'
+            }), 400
+
         # Fix (M2-R08): parameterized INSERT and hashed password.
         execute_query(
             "INSERT INTO users (username, password, account_number, is_admin) VALUES (%s, %s, %s, true)",
