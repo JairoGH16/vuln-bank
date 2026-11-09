@@ -503,11 +503,12 @@ function renderVirtualCards() {
         return;
     }
     
-    // Vulnerability: XSS possible in card rendering
+    // Fix (M3-R19): card_type is free text at creation (no server-side
+    // whitelist), so it must be escaped before it reaches innerHTML here.
     container.innerHTML = virtualCards.map(card => `
-        <div class="virtual-card ${String(card.card_type || '').toLowerCase()} ${card.is_frozen ? 'frozen' : ''}" id="card-${card.id}">
+        <div class="virtual-card ${escapeHtml(String(card.card_type || '').toLowerCase())} ${card.is_frozen ? 'frozen' : ''}" id="card-${card.id}">
             <div class="card-topline">
-                <div class="card-type">${card.card_type.toUpperCase()}</div>
+                <div class="card-type">${escapeHtml(card.card_type.toUpperCase())}</div>
                 <div class="card-currency-badge">${card.currency || 'USD'}</div>
             </div>
             <div class="card-number">${formatCardNumber(card.card_number)}</div>
@@ -567,7 +568,7 @@ function showCardDetails(cardId) {
         </div>
         <div class="form-group">
             <label>Card Type</label>
-            <p>${card.card_type}</p>
+            <p>${escapeHtml(card.card_type)}</p>
         </div>
         <div class="form-group">
             <label>Currency</label>
