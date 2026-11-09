@@ -2094,12 +2094,15 @@ def fund_virtual_card(current_user, card_id):
         """
         user_result = execute_query(user_query, (current_user['user_id'],))
 
+        # Fix (M3-R18): scope the card lookup to the authenticated user,
+        # closing a BOLA that let any user fund (and see the balance of)
+        # another user's card.
         card_query = """
             SELECT id, user_id, card_number, card_limit, current_balance, is_frozen, currency, card_type
             FROM virtual_cards
-            WHERE id = %s
+            WHERE id = %s AND user_id = %s
         """
-        card_result = execute_query(card_query, (card_id,))
+        card_result = execute_query(card_query, (card_id, current_user['user_id']))
 
         if not user_result or not card_result:
             return jsonify({
