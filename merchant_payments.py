@@ -1,11 +1,10 @@
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from functools import wraps
-import hashlib
-import random
-import string
-import time
+import secrets
 
 from flask import jsonify, redirect, render_template, request
+from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 
 import auth
@@ -14,16 +13,17 @@ from database import execute_query
 
 
 def generate_merchant_api_key():
-    """Generate a predictable merchant API key"""
-    # Vulnerability: API keys are derived from a four-digit code.
-    four_digit_code = ''.join(random.choices(string.digits, k=4))
-    return f"vk_{hashlib.sha256(four_digit_code.encode()).hexdigest()}"
+    """Generate a merchant API key"""
+    # Fix (M3-R15): drawn from the CSPRNG instead of a 4-digit (10,000
+    # possibility) seed, so the key can no longer be brute-forced offline.
+    return f"vk_{secrets.token_hex(32)}"
 
 
 def generate_authorization_code():
-    """Generate a predictable payment authorization code"""
-    # Vulnerability: Authorization codes are timestamp-based and predictable
-    return f"AUTH{int(time.time())}{random.randint(100, 999)}"
+    """Generate a payment authorization code"""
+    # Fix (M3-R15): drawn from the CSPRNG instead of timestamp + 3 random
+    # digits, so it can no longer be guessed or replayed.
+    return f"AUTH{secrets.token_hex(8).upper()}"
 
 
 def generate_merchant_token(merchant):
@@ -56,14 +56,17 @@ def get_merchant_from_request():
     """
     Resolve merchant identity from either a plaintext API key or weak JWT.
     """
+    # Fix (M3-R16): parameterized lookups close the SQL injection / auth
+    # bypass reachable through the X-Merchant-Api-Key header and the JWT
+    # merchant_id claim.
     api_key = request.headers.get('X-Merchant-Api-Key')
     if api_key:
-        query = f"""
+        query = """
             SELECT id, name, email, api_key, is_active, created_at
             FROM merchants
-            WHERE api_key = '{api_key}'
+            WHERE api_key = %s
         """
-        merchants = execute_query(query)
+        merchants = execute_query(query, (api_key,))
         if merchants:
             return merchant_tuple_to_dict(merchants[0]), 'api_key'
 
@@ -73,12 +76,12 @@ def get_merchant_from_request():
         payload = verify_token(token)
         if payload and payload.get('is_merchant'):
             merchant_id = payload.get('merchant_id')
-            query = f"""
+            query = """
                 SELECT id, name, email, api_key, is_active, created_at
                 FROM merchants
-                WHERE id = {merchant_id}
+                WHERE id = %s
             """
-            merchants = execute_query(query)
+            merchants = execute_query(query, (merchant_id,))
             if merchants:
                 return merchant_tuple_to_dict(merchants[0]), 'jwt'
 
@@ -156,13 +159,14 @@ def init_merchant_payment_routes(app):
             password = data.get('password')
             api_key = generate_merchant_api_key()
 
-            # Vulnerability: SQL injection possible and plaintext password/API key storage
-            query = f"""
+            # Fix (M3-R14): parameterized INSERT prevents SQL injection; the
+            # password is hashed instead of stored in plaintext.
+            query = """
                 INSERT INTO merchants (name, email, password, api_key)
-                VALUES ('{name}', '{email}', '{password}', '{api_key}')
+                VALUES (%s, %s, %s, %s)
                 RETURNING id, name, email, api_key, is_active, created_at
             """
-            result = execute_query(query)
+            result = execute_query(query, (name, email, generate_password_hash(password), api_key))
 
             if not result:
                 return jsonify({
@@ -205,15 +209,15 @@ def init_merchant_payment_routes(app):
             email = data.get('email')
             password = data.get('password')
 
-            # Vulnerability: SQL injection and plaintext password comparison
-            query = f"""
-                SELECT id, name, email, api_key, is_active, created_at
-                FROM merchants
-                WHERE email = '{email}' AND password = '{password}'
-            """
-            result = execute_query(query)
+            # Fix (M3-R14): parameterized lookup by email only, then verify
+            # the password against its hash, closing the SQL injection and
+            # the auth-bypass it enabled.
+            result = execute_query(
+                "SELECT id, name, email, api_key, is_active, created_at, password FROM merchants WHERE email = %s",
+                (email,)
+            )
 
-            if not result:
+            if not result or not check_password_hash(result[0][6], password or ''):
                 return jsonify({
                     'status': 'error',
                     'message': 'Invalid merchant credentials'
@@ -254,7 +258,19 @@ def init_merchant_payment_routes(app):
     def charge_card(current_merchant):
         try:
             data = request.get_json() or {}
-            amount = float(data.get('amount'))
+
+            # Fix (M3-R17): validate the amount is a positive, finite number
+            # within a sane range, same as /transfer and create_bill_payment.
+            # Without this, a negative amount passed the balance check below
+            # and increased the card's balance instead of charging it.
+            try:
+                amount = Decimal(str(data.get('amount')))
+            except (InvalidOperation, TypeError):
+                return jsonify({'status': 'error', 'message': 'Invalid amount'}), 400
+            if not amount.is_finite() or amount <= 0 or amount > Decimal('1000000'):
+                return jsonify({'status': 'error', 'message': 'Amount must be between 0 and 1,000,000'}), 400
+            amount = float(amount.quantize(Decimal('0.01')))
+
             currency = data.get('currency', 'USD')
             card_number = data.get('card_number')
             cvv = data.get('cvv')
@@ -263,7 +279,8 @@ def init_merchant_payment_routes(app):
             description = data.get('description', 'Merchant payment')
 
             # Vulnerability: Raw card details are queried directly and SQL injection is possible
-            card_query = f"""
+            # Fix (M3-R07/M3-R10): parameterized card lookup prevents SQL injection.
+            card_query = """
                 SELECT
                     vc.id,
                     vc.user_id,
@@ -280,26 +297,21 @@ def init_merchant_payment_routes(app):
                     u.username
                 FROM virtual_cards vc
                 JOIN users u ON vc.user_id = u.id
-                WHERE vc.card_number = '{card_number}'
+                WHERE vc.card_number = %s
             """
-            card_result = execute_query(card_query)
+            card_result = execute_query(card_query, (card_number,))
 
             if not card_result:
                 payment_id = record_merchant_payment(
                     current_merchant['id'], None, amount, currency, 'failed',
                     merchant_order_id, None, 'invalid_card_number'
                 )
+                # Fix (M3-R10): generic decline; the specific reason is logged
+                # internally but never returned, removing the card-testing oracle.
                 return jsonify({
                     'status': 'error',
                     'message': 'Payment declined',
                     'payment_id': payment_id,
-                    'failure_reason': 'invalid_card_number',
-                    'debug_info': {
-                        'auth_method': current_merchant.get('auth_method'),
-                        'merchant_id': current_merchant.get('id'),
-                        'merchant_name': current_merchant.get('name'),
-                        'submitted_card_number': card_number
-                    }
                 }), 400
 
             card = card_result[0]
@@ -328,21 +340,12 @@ def init_merchant_payment_routes(app):
                     current_merchant['id'], card_id, amount, currency, 'failed',
                     merchant_order_id, None, failure_reason
                 )
+                # Fix (M3-R10): generic decline; the specific reason is logged
+                # internally but never returned, removing the card-testing oracle.
                 return jsonify({
                     'status': 'error',
                     'message': 'Payment declined',
                     'payment_id': payment_id,
-                    'failure_reason': failure_reason,
-                    'debug_info': {
-                        'auth_method': current_merchant.get('auth_method'),
-                        'merchant_id': current_merchant.get('id'),
-                        'merchant_name': current_merchant.get('name'),
-                        'card_id': card_id,
-                        'card_currency': card_currency,
-                        'card_balance': card_balance,
-                        'is_frozen': is_frozen,
-                        'is_active': is_active
-                    }
                 }), 400
 
             authorization_code = generate_authorization_code()
@@ -551,7 +554,11 @@ def init_merchant_payment_routes(app):
     @merchant_required
     def list_payments_by_merchant_id(current_merchant, merchant_id):
         try:
-            query = f"""
+            # Fix (M3-R11): a merchant may only list its own payments.
+            if merchant_id != current_merchant['id']:
+                return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+
+            query = """
                 SELECT
                     mp.id,
                     mp.merchant_id,
@@ -568,10 +575,10 @@ def init_merchant_payment_routes(app):
                 FROM merchant_payments mp
                 JOIN merchants m ON mp.merchant_id = m.id
                 LEFT JOIN virtual_cards vc ON mp.card_id = vc.id
-                WHERE mp.merchant_id = {merchant_id}
+                WHERE mp.merchant_id = %s
                 ORDER BY mp.created_at DESC
             """
-            payments = execute_query(query)
+            payments = execute_query(query, (merchant_id,))
 
             return jsonify({
                 'status': 'success',

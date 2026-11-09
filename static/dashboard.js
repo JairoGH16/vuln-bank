@@ -414,7 +414,7 @@ async function fetchTransactions() {
                                 ${isOutgoing ? 'To: ' + t.to_account : 'From: ' + t.from_account}
                             </div>
                             <div class="transaction-date">${t.timestamp}</div>
-                            ${t.description ? `<div class="transaction-description">${t.description}</div>` : ''}
+                            ${t.description ? `<div class="transaction-description">${escapeHtml(t.description)}</div>` : ''}
                         </div>
                         <div class="transaction-amount ${transactionType}">
                             ${isOutgoing ? '-' : '+'}$${Math.abs(t.amount)}
@@ -504,11 +504,12 @@ function renderVirtualCards() {
         return;
     }
     
-    // Vulnerability: XSS possible in card rendering
+    // Fix (M3-R19): card_type is free text at creation (no server-side
+    // whitelist), so it must be escaped before it reaches innerHTML here.
     container.innerHTML = virtualCards.map(card => `
-        <div class="virtual-card ${String(card.card_type || '').toLowerCase()} ${card.is_frozen ? 'frozen' : ''}" id="card-${card.id}">
+        <div class="virtual-card ${escapeHtml(String(card.card_type || '').toLowerCase())} ${card.is_frozen ? 'frozen' : ''}" id="card-${card.id}">
             <div class="card-topline">
-                <div class="card-type">${card.card_type.toUpperCase()}</div>
+                <div class="card-type">${escapeHtml(card.card_type.toUpperCase())}</div>
                 <div class="card-currency-badge">${card.currency || 'USD'}</div>
             </div>
             <div class="card-number">${formatCardNumber(card.card_number)}</div>
@@ -568,7 +569,7 @@ function showCardDetails(cardId) {
         </div>
         <div class="form-group">
             <label>Card Type</label>
-            <p>${card.card_type}</p>
+            <p>${escapeHtml(card.card_type)}</p>
         </div>
         <div class="form-group">
             <label>Currency</label>
@@ -757,7 +758,7 @@ async function showTransactionHistory(cardId) {
                     ${data.transactions.map(t => `
                         <div class="transaction-item">
                             <div class="transaction-details">
-                                <div class="transaction-account">${t.merchant}</div>
+                                <div class="transaction-account">${escapeHtml(t.merchant)}</div>
                                 <div class="transaction-date">${new Date(t.timestamp).toLocaleString()}</div>
                             </div>
                             <div class="transaction-amount">${formatCurrencyAmount(t.amount, t.currency)}</div>
@@ -1040,7 +1041,7 @@ async function loadPaymentHistory() {
                         </div>
                         <div>Reference: ${payment.reference}</div>
                         <div>Date: ${new Date(payment.created_at).toLocaleString()}</div>
-                        ${payment.description ? `<div>Description: ${payment.description}</div>` : ''}
+                        ${payment.description ? `<div>Description: ${escapeHtml(payment.description)}</div>` : ''}
                     </div>
                 </div>
             `).join('');
