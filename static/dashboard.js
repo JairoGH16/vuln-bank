@@ -756,7 +756,7 @@ async function showTransactionHistory(cardId) {
                     ${data.transactions.map(t => `
                         <div class="transaction-item">
                             <div class="transaction-details">
-                                <div class="transaction-account">${t.merchant}</div>
+                                <div class="transaction-account">${escapeHtml(t.merchant)}</div>
                                 <div class="transaction-date">${new Date(t.timestamp).toLocaleString()}</div>
                             </div>
                             <div class="transaction-amount">${formatCurrencyAmount(t.amount, t.currency)}</div>
