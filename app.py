@@ -1907,8 +1907,11 @@ def create_virtual_card(current_user):
 @token_required
 def get_virtual_cards(current_user):
     try:
-        # Vulnerability: No pagination
-        query = f"""
+        # Fix (M3-R20): parameterized query. This was still an f-string
+        # relying on current_user['user_id'] being trustworthy; it isn't on
+        # a branch predating the auth module's JWT hardening (weak secret,
+        # 'none' algorithm accepted), so it was a real SQL injection there.
+        query = """
             SELECT
                 id,
                 card_number,
@@ -1922,11 +1925,11 @@ def get_virtual_cards(current_user):
                 last_used_at,
                 card_type,
                 currency
-            FROM virtual_cards 
-            WHERE user_id = {current_user['user_id']}
+            FROM virtual_cards
+            WHERE user_id = %s
         """
-        
-        cards = execute_query(query)
+
+        cards = execute_query(query, (current_user['user_id'],))
         
         # Vulnerability: Sensitive data exposure
         return jsonify({
