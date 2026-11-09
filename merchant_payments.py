@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 import secrets
 
@@ -55,14 +56,17 @@ def get_merchant_from_request():
     """
     Resolve merchant identity from either a plaintext API key or weak JWT.
     """
+    # Fix (M3-R16): parameterized lookups close the SQL injection / auth
+    # bypass reachable through the X-Merchant-Api-Key header and the JWT
+    # merchant_id claim.
     api_key = request.headers.get('X-Merchant-Api-Key')
     if api_key:
-        query = f"""
+        query = """
             SELECT id, name, email, api_key, is_active, created_at
             FROM merchants
-            WHERE api_key = '{api_key}'
+            WHERE api_key = %s
         """
-        merchants = execute_query(query)
+        merchants = execute_query(query, (api_key,))
         if merchants:
             return merchant_tuple_to_dict(merchants[0]), 'api_key'
 
@@ -72,12 +76,12 @@ def get_merchant_from_request():
         payload = verify_token(token)
         if payload and payload.get('is_merchant'):
             merchant_id = payload.get('merchant_id')
-            query = f"""
+            query = """
                 SELECT id, name, email, api_key, is_active, created_at
                 FROM merchants
-                WHERE id = {merchant_id}
+                WHERE id = %s
             """
-            merchants = execute_query(query)
+            merchants = execute_query(query, (merchant_id,))
             if merchants:
                 return merchant_tuple_to_dict(merchants[0]), 'jwt'
 
@@ -254,7 +258,19 @@ def init_merchant_payment_routes(app):
     def charge_card(current_merchant):
         try:
             data = request.get_json() or {}
-            amount = float(data.get('amount'))
+
+            # Fix (M3-R17): validate the amount is a positive, finite number
+            # within a sane range, same as /transfer and create_bill_payment.
+            # Without this, a negative amount passed the balance check below
+            # and increased the card's balance instead of charging it.
+            try:
+                amount = Decimal(str(data.get('amount')))
+            except (InvalidOperation, TypeError):
+                return jsonify({'status': 'error', 'message': 'Invalid amount'}), 400
+            if not amount.is_finite() or amount <= 0 or amount > Decimal('1000000'):
+                return jsonify({'status': 'error', 'message': 'Amount must be between 0 and 1,000,000'}), 400
+            amount = float(amount.quantize(Decimal('0.01')))
+
             currency = data.get('currency', 'USD')
             card_number = data.get('card_number')
             cvv = data.get('cvv')
